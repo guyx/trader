@@ -19,6 +19,7 @@ import xml.etree.ElementTree as ET
 import configparser
 from appdirs import AppDirs
 from trader import version as app_ver
+from pathlib import Path
 
 config_example = """# trader configuration file
 [MSG_CHANNEL]
@@ -71,8 +72,44 @@ if not os.path.exists(config_file):
 config = configparser.ConfigParser(interpolation=None)
 config.read(config_file)
 
+# 获取配置文件路径
+config_dir = os.path.expanduser('~/.trader')
+if not os.path.exists(config_dir):
+    os.makedirs(config_dir)
+
+config_path = os.path.join(config_dir, 'config.ini')
+if not os.path.exists(config_path):
+    print(f'create config file: {config_path}')
+    with open(config_path, 'w') as f:
+        f.write('''[TRADE]
+broker_id = 9999
+investor_id = test001
+password = test123
+command_timeout = 10
+ignore_inst = WH,bb,JR,RI,RS,LR,PM,im
+
+[MSG_CHANNEL]
+market_response_format = MSG:CTP:RSP:MARKET:{}:{}
+trade_response_format = MSG:CTP:RSP:TRADE:{}:{}
+request_format = MSG:CTP:REQ:{}
+
+[LOG]
+level = DEBUG
+format = %%(asctime)s %%(levelname)s %%(message)s
+''')
+
+# 读取配置文件
+config = configparser.ConfigParser()
+config.read(config_path)
+
+# 读取错误码
+current_dir = os.path.dirname(os.path.abspath(__file__))
+ctp_xml_path = os.path.join(current_dir, 'error.xml')
 ctp_errors = {}
-ctp_xml_path = 'D:/github/trader/trader/utils/error.xml' if sys.platform == 'win32' \
-    else '/root/gitee/trader/trader/utils/error.xml'
 for error in ET.parse(ctp_xml_path).getroot():
-    ctp_errors[int(error.attrib['value'])] = error.attrib['prompt']
+    error_id = error.get('id')
+    try:
+        error_id = int(error_id)
+    except ValueError:
+        continue  # 跳过非数字的id
+    ctp_errors[error_id] = error.get('value')

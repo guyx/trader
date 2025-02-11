@@ -18,6 +18,7 @@ from pandas.io.sql import read_sql_query
 from django.db import models
 from django.db import connection
 from django.core.exceptions import EmptyResultSet
+from decimal import Decimal
 
 from .const import *
 
@@ -59,27 +60,18 @@ class Address(models.Model):
 
 
 class Broker(models.Model):
-    name = models.CharField(verbose_name='名称', max_length=64)
-    contract_type = models.CharField(verbose_name='市场', max_length=32, choices=ContractType.choices)
-    trade_address = models.ForeignKey(Address, verbose_name='交易前置', on_delete=models.CASCADE,
-                                      related_name='trade_address')
-    market_address = models.ForeignKey(Address, verbose_name='行情前置', on_delete=models.CASCADE,
-                                       related_name='market_address')
-    identify = models.CharField(verbose_name='唯一标志', max_length=32)
-    username = models.CharField(verbose_name='用户名', max_length=32)
-    password = models.CharField(verbose_name='密码', max_length=32)
-    fake = models.DecimalField(verbose_name='虚拟资金', null=True, max_digits=12, decimal_places=2)
-    cash = models.DecimalField(verbose_name='可用资金', null=True, max_digits=12, decimal_places=2)
-    current = models.DecimalField(verbose_name='动态权益', null=True, max_digits=12, decimal_places=2)
-    pre_balance = models.DecimalField(verbose_name='静态权益', null=True, max_digits=12, decimal_places=2)
-    margin = models.DecimalField(verbose_name='保证金', null=True, max_digits=12, decimal_places=2)
-
-    class Meta:
-        verbose_name = '账户'
-        verbose_name_plural = '账户列表'
+    name = models.CharField(max_length=50, unique=True)
+    broker_id = models.CharField(max_length=20)
+    investor_id = models.CharField(max_length=20)
+    password = models.CharField(max_length=50)
+    fake = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal('0'))
+    current = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal('0'))
+    pre_balance = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal('0'))
+    cash = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal('0'))
+    margin = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal('0'))
 
     def __str__(self):
-        return '{}-{}'.format(self.name, self.get_contract_type_display())
+        return self.name
 
 
 class Performance(models.Model):
@@ -102,72 +94,42 @@ class Performance(models.Model):
 
 
 class Strategy(models.Model):
-    broker = models.ForeignKey(Broker, verbose_name='账户', on_delete=models.CASCADE)
-    name = models.CharField(verbose_name='名称', max_length=64)
-    instruments = models.ManyToManyField('Instrument', verbose_name='交易品种')
-    force_opens = models.ManyToManyField('Instrument', verbose_name='手动开仓', related_name='force_opens', blank=True)
-
-    class Meta:
-        verbose_name = '策略'
-        verbose_name_plural = '策略列表'
+    name = models.CharField(max_length=50)
+    broker = models.ForeignKey(Broker, on_delete=models.CASCADE)
+    instruments = models.ManyToManyField('Instrument', blank=True)
+    force_opens = models.ManyToManyField('Instrument', blank=True, related_name='force_open_strategies')
 
     def __str__(self):
-        return '{}'.format(self.name)
-
-    def get_instruments(self):
-        return [inst for inst in self.instruments.all()]
-    get_instruments.short_description = '交易合约'
-    get_instruments.allow_tags = True
-
-    def get_force_opens(self):
-        return [inst for inst in self.force_opens.all()]
-    get_force_opens.short_description = '手动开仓'
-    get_force_opens.allow_tags = True
+        return self.name
 
 
-class Param(models.Model):
-    strategy = models.ForeignKey(Strategy, verbose_name='策略', on_delete=models.CASCADE)
-    code = models.CharField('参数名', max_length=64)
-    str_value = models.CharField('字符串值', max_length=128, null=True, blank=True)
-    int_value = models.IntegerField('整数值', null=True, blank=True)
-    float_value = models.DecimalField('浮点值', null=True, max_digits=12, decimal_places=3, blank=True)
-    update_time = models.DateTimeField('更新时间', auto_now=True)
-
-    class Meta:
-        verbose_name = '策略参数'
-        verbose_name_plural = '策略参数列表'
+class Parameter(models.Model):
+    strategy = models.ForeignKey(Strategy, on_delete=models.CASCADE, related_name='param_set')
+    code = models.CharField(max_length=50)
+    name = models.CharField(max_length=50)
+    int_value = models.IntegerField(null=True, blank=True)
+    float_value = models.FloatField(null=True, blank=True)
 
     def __str__(self):
-        return '{}: {} = {}'.format(
-            self.strategy, self.code,
-            next((v for v in [self.str_value, self.int_value, self.float_value] if v is not None), '-'))
+        return f"{self.strategy.name}-{self.name}"
 
 
 class Instrument(models.Model):
-    exchange = models.CharField('交易所', max_length=8, choices=ExchangeType.choices)
-    section = models.CharField('分类', max_length=48, null=True, blank=True, choices=SectionType.choices)
-    sort = models.CharField('品种', max_length=48, null=True, blank=True, choices=SortType.choices)
-    name = models.CharField('名称', max_length=32, null=True, blank=True)
-    product_code = models.CharField('代码', max_length=16, unique=True)
-    all_inst = models.CharField('品种列表', max_length=256, null=True, blank=True)
-    main_code = models.CharField('主力合约', max_length=16, null=True, blank=True)
-    last_main = models.CharField('上个主力', max_length=16, null=True, blank=True)
-    change_time = models.DateTimeField('切换时间', null=True, blank=True)
-    night_trade = models.BooleanField('夜盘', default=False)
-    volume_multiple = models.IntegerField('合约乘数', null=True, blank=True)
-    price_tick = models.DecimalField('最小变动', max_digits=8, decimal_places=3, null=True, blank=True)
-    margin_rate = models.DecimalField('保证金率', max_digits=6, decimal_places=5, null=True, blank=True)
-    fee_money = models.DecimalField('金额手续费', max_digits=7, decimal_places=6, null=True, blank=True)
-    fee_volume = models.DecimalField('手数手续费', max_digits=6, decimal_places=2, null=True, blank=True)
-    up_limit_ratio = models.DecimalField('涨停幅度', max_digits=3, decimal_places=2, null=True, blank=True)
-    down_limit_ratio = models.DecimalField('跌停幅度', max_digits=3, decimal_places=2, null=True, blank=True)
-
-    class Meta:
-        verbose_name = '合约'
-        verbose_name_plural = '合约列表'
+    product_code = models.CharField(max_length=20)
+    exchange = models.CharField(max_length=10)
+    name = models.CharField(max_length=50, blank=True)
+    volume_multiple = models.IntegerField(default=1)
+    price_tick = models.DecimalField(max_digits=10, decimal_places=3, default=Decimal('0.001'))
+    margin_rate = models.DecimalField(max_digits=5, decimal_places=3, default=Decimal('0.1'))
+    fee_money = models.DecimalField(max_digits=5, decimal_places=5, default=Decimal('0'))
+    fee_volume = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0'))
+    main_code = models.CharField(max_length=20, blank=True)
+    all_inst = models.TextField(blank=True)
+    night_trade = models.BooleanField(default=False)
+    section = models.CharField(max_length=50, blank=True)
 
     def __str__(self):
-        return '{}.{}'.format(self.get_exchange_display(), self.name)
+        return f"{self.exchange}.{self.product_code}"
 
 
 class Signal(models.Model):

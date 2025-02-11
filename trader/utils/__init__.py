@@ -35,7 +35,7 @@ from tqdm import tqdm
 
 from panel.models import *
 from trader.utils import ApiStruct
-from trader.utils.read_config import config
+from trader.utils.read_config import config, ctp_errors
 
 logger = logging.getLogger('utils')
 
@@ -98,7 +98,7 @@ async def is_trading_day(day: datetime.datetime):
     return day, day.strftime('%Y%m%d') in (s.get('TradingDay'), s.get('LastTradingDay'))
 
 
-async def check_trading_day(day: datetime.datetime) -> (datetime.datetime, bool):
+async def check_trading_day(day: datetime.datetime) -> tuple[datetime.datetime, bool]:
     async with aiohttp.ClientSession() as session:
         await max_conn_cffex.acquire()
         async with session.get(

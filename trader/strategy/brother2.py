@@ -30,6 +30,7 @@ from trader.utils.read_config import config, ctp_errors
 from trader.utils import ApiStruct, price_round, is_trading_day, update_from_shfe, update_from_dce, update_from_czce, update_from_cffex, \
     get_contracts_argument, calc_main_inst, str_to_number, get_next_id, ORDER_REF_SIGNAL_ID_START, update_from_gfex
 from panel.models import *
+from asgiref.sync import sync_to_async
 
 logger = logging.getLogger('CTPApi')
 HANDLER_TIME_OUT = config.getint('TRADE', 'command_timeout', fallback=10)
@@ -42,51 +43,132 @@ class TradeStrategy(BaseModule):
         self.__trade_response_format = config.get('MSG_CHANNEL', 'trade_response_format')
         self.__request_format = config.get('MSG_CHANNEL', 'request_format')
         self.__ignore_inst_list = config.get('TRADE', 'ignore_inst', fallback="WH,bb,JR,RI,RS,LR,PM,im").split(',')
-        self.__strategy = Strategy.objects.get(name=name)
-        self.__inst_ids = self.__strategy.instruments.all().values_list('product_code', flat=True)
-        self.__broker = self.__strategy.broker
-        self.__fake = self.__broker.fake  # 虚拟资金
-        self.__current = self.__broker.current  # 当前动态权益
-        self.__pre_balance = self.__broker.pre_balance  # 静态权益
-        self.__cash = self.__broker.cash  # 可用资金
+        self.name = name
+        self.__strategy = None
+        self.__inst_ids = None
+        self.__broker = None
+        self.__fake = None
+        self.__current = None
+        self.__pre_balance = None
+        self.__cash = None
         self.__shares = dict()  # { instrument : position }
         self.__cur_account = None
-        self.__margin = self.__broker.margin  # 占用保证金
+        self.__margin = None
         self.__withdraw = 0  # 出金
         self.__deposit = 0  # 入金
         self.__activeOrders = dict()  # 未成交委托单
         self.__cur_pos = dict()  # 持有头寸
         self.__re_extract_code = re.compile(r'([a-zA-Z]*)(\d+)')  # 提合约字母部分 IF1509 -> IF
         self.__re_extract_name = re.compile('(.*?)([0-9]+)(.*?)$')  # 提取合约文字部分
-        self.__trading_day = timezone.make_aware(datetime.datetime.strptime(self.raw_redis.get("TradingDay")+'08', '%Y%m%d%H'))
-        self.__last_trading_day = timezone.make_aware(datetime.datetime.strptime(self.raw_redis.get("LastTradingDay")+'08', '%Y%m%d%H'))
+        
+        # 设置默认的交易日期
+        today = datetime.datetime.now()
+        trading_day = self.raw_redis.get("TradingDay")
+        last_trading_day = self.raw_redis.get("LastTradingDay")
+        
+        if trading_day is None:
+            trading_day = today.strftime('%Y%m%d')
+            self.raw_redis.set("TradingDay", trading_day)
+        
+        if last_trading_day is None:
+            last_trading_day = (today - datetime.timedelta(days=1)).strftime('%Y%m%d')
+            self.raw_redis.set("LastTradingDay", last_trading_day)
+        
+        self.__trading_day = timezone.make_aware(datetime.datetime.strptime(trading_day + '08', '%Y%m%d%H'))
+        self.__last_trading_day = timezone.make_aware(datetime.datetime.strptime(last_trading_day + '08', '%Y%m%d%H'))
+
+    async def initialize(self):
+        try:
+            # 使用sync_to_async包装所有同步数据库操作
+            get_strategy = sync_to_async(Strategy.objects.get)
+            self.__strategy = await get_strategy(name=self.name)
+            
+            # 包装broker访问
+            get_broker = sync_to_async(lambda: self.__strategy.broker)
+            self.__broker = await get_broker()
+            
+            # 包装instruments访问
+            get_inst_ids = sync_to_async(lambda: list(self.__strategy.instruments.all().values_list('product_code', flat=True)))
+            self.__inst_ids = await get_inst_ids()
+            
+            # 包装其他属性访问
+            get_broker_attrs = sync_to_async(lambda: {
+                'fake': self.__broker.fake,
+                'current': self.__broker.current,
+                'pre_balance': self.__broker.pre_balance,
+                'cash': self.__broker.cash,
+                'margin': self.__broker.margin,
+            })
+            broker_attrs = await get_broker_attrs()
+            
+            # 设置属性
+            self.__fake = broker_attrs['fake']
+            self.__current = broker_attrs['current']
+            self.__pre_balance = broker_attrs['pre_balance']
+            self.__cash = broker_attrs['cash']
+            self.__margin = broker_attrs['margin']
+            
+            # 重置其他属性
+            self.__shares = dict()
+            self.__cur_account = None
+            self.__withdraw = 0
+            self.__deposit = 0
+            self.__activeOrders = dict()
+            self.__cur_pos = dict()
+            
+            logger.info("Strategy initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Error initializing strategy: {e}")
+            raise
 
     async def start(self):
-        await self.install()
-        self.raw_redis.set('HEARTBEAT:TRADER', 1, ex=61)
-        today = timezone.localtime()
-        now = int(today.strftime('%H%M'))
-        if today.isoweekday() < 6 and (820 <= now <= 1550 or 2010 <= now <= 2359):  # 非交易时间查不到数据
-            await self.refresh_account()
-            order_list = await self.query('Order')
-            for order in order_list:
-                # 未成交订单
-                if int(order['OrderStatus']) in range(1, 5) and order['OrderSubmitStatus'] == ApiStruct.OSS_Accepted:
-                    direct_str = DirectionType.values[order['Direction']]
-                    logger.info(f"撤销未成交订单: 合约{order['InstrumentID']} {direct_str}单 {order['VolumeTotal']}手 价格{order['LimitPrice']}")
-                    await self.cancel_order(order)
-                # 已成交订单
-                elif order['OrderSubmitStatus'] == ApiStruct.OSS_Accepted:
-                    self.save_order(order)
-            await self.refresh_position()
-        # today = timezone.make_aware(datetime.datetime.strptime(self.raw_redis.get('LastTradingDay'), '%Y%m%d'))
-        # self.calculate(today, create_main_bar=False)
-        # await self.processing_signal3()
+        try:
+            await self.install()
+            self.raw_redis.set('HEARTBEAT:TRADER', 1, ex=61)
+            today = timezone.localtime()
+            now = int(today.strftime('%H%M'))
+            
+            if today.isoweekday() < 6 and (820 <= now <= 1550 or 2010 <= now <= 2359):  # 非交易时间查不到数据
+                try:
+                    await self.refresh_account()
+                except Exception as e:
+                    logger.error(f"refresh_account error: {e}")
+                
+                try:
+                    order_list = await self.query('Order')
+                    if order_list:  # 添加空值检查
+                        for order in order_list:
+                            # 未成交订单
+                            if int(order['OrderStatus']) in range(1, 5) and order['OrderSubmitStatus'] == ApiStruct.OSS_Accepted:
+                                direct_str = DirectionType.values[order['Direction']]
+                                logger.info(f"撤销未成交订单: 合约{order['InstrumentID']} {direct_str}单 {order['VolumeTotal']}手 价格{order['LimitPrice']}")
+                                await self.cancel_order(order)
+                            # 已成交订单
+                            elif order['OrderSubmitStatus'] == ApiStruct.OSS_Accepted:
+                                self.save_order(order)
+                except Exception as e:
+                    logger.error(f"Process orders error: {e}")
+                
+                try:
+                    await self.refresh_position()
+                except Exception as e:
+                    logger.error(f"refresh_position error: {e}")
+            
+            logger.info("Strategy started successfully")
+            
+        except Exception as e:
+            logger.error(f"Strategy start error: {e}")
+            raise
 
     async def refresh_account(self):
         try:
             logger.debug('更新账户')
             account = await self.query('TradingAccount')
+            if not account:
+                logger.warning("Failed to get account info")
+                return
+            
             account = account[0]
             self.__withdraw = Decimal(account['Withdraw'])
             self.__deposit = Decimal(account['Deposit'])
@@ -233,28 +315,40 @@ class TradeStrategy(BaseModule):
             if 'bIsLast' not in msg_dict or msg_dict['bIsLast']:
                 return msg_list
 
-    async def query(self, query_type: str, **kwargs):
-        sub_client = None
-        channel_rsp_qry, channel_rsp_err = None, None
-        try:
-            sub_client = self.redis_client.pubsub(ignore_subscribe_messages=True)
-            request_id = get_next_id()
-            kwargs['RequestID'] = request_id
-            channel_rsp_qry = self.__trade_response_format.format('OnRspQry' + query_type, request_id)
-            channel_rsp_err = self.__trade_response_format.format('OnRspError', request_id)
-            await sub_client.psubscribe(channel_rsp_qry, channel_rsp_err)
-            task = asyncio.create_task(self.query_reader(sub_client))
-            self.raw_redis.publish(self.__request_format.format('ReqQry' + query_type), json.dumps(kwargs))
-            await asyncio.wait_for(task, HANDLER_TIME_OUT)
-            await sub_client.punsubscribe()
-            await sub_client.close()
-            return task.result()
-        except Exception as e:
-            logger.warning(f'{query_type} 发生错误: {repr(e)}', exc_info=True)
-            if sub_client and channel_rsp_qry:
-                await sub_client.unsubscribe()
-                await sub_client.close()
-            return None
+    async def query(self, query_type: str, retry_times=3, **kwargs):
+        for i in range(retry_times):
+            try:
+                sub_client = None
+                channel_rsp_qry, channel_rsp_err = None, None
+                try:
+                    sub_client = self.redis_client.pubsub(ignore_subscribe_messages=True)
+                    request_id = get_next_id()
+                    kwargs['RequestID'] = request_id
+                    channel_rsp_qry = self.__trade_response_format.format('OnRspQry' + query_type, request_id)
+                    channel_rsp_err = self.__trade_response_format.format('OnRspError', request_id)
+                    await sub_client.psubscribe(channel_rsp_qry, channel_rsp_err)
+                    task = asyncio.create_task(self.query_reader(sub_client))
+                    self.raw_redis.publish(self.__request_format.format('ReqQry' + query_type), json.dumps(kwargs))
+                    result = await asyncio.wait_for(task, HANDLER_TIME_OUT)
+                    await sub_client.punsubscribe()
+                    await sub_client.close()
+                    return result
+                except asyncio.TimeoutError:
+                    logger.warning(f"Query timeout, retry {i+1}/{retry_times}")
+                    if sub_client and channel_rsp_qry:
+                        await sub_client.unsubscribe()
+                        await sub_client.close()
+                    continue
+                except Exception as e:
+                    logger.error(f"Query error: {e}")
+                    if sub_client and channel_rsp_qry:
+                        await sub_client.unsubscribe()
+                        await sub_client.close()
+                    return None
+            except Exception as e:
+                logger.error(f"Query outer error: {e}")
+                continue
+        return None
 
     async def SubscribeMarketData(self, inst_ids: list):
         sub_client = None
@@ -718,7 +812,7 @@ class TradeStrategy(BaseModule):
         except Exception as e:
             logger.warning(f'calculate 发生错误: {repr(e)}', exc_info=True)
 
-    def calc_signal(self, inst: Instrument, day: datetime.datetime) -> (Signal, Decimal):
+    def calc_signal(self, inst: Instrument, day: datetime.datetime) -> tuple[Signal, Decimal]:
         try:
             break_n = self.__strategy.param_set.get(code='BreakPeriod').int_value
             atr_n = self.__strategy.param_set.get(code='AtrPeriod').int_value
